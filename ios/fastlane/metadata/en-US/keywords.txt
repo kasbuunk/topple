@@ -1,0 +1,1 @@
+logic,puzzle,strategy,board game,boolean,proof,math,duel,turn-based,abstract

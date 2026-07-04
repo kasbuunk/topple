@@ -1,0 +1,17 @@
+One formula. ⊤ wants it to end true; ⊥ wants it to end false.
+
+Topple is an abstract strategy game played on a boolean formula. Each turn you pick any atom on the board and set it to ⊤ or ⊥ — every occurrence at once. The board then rewrites itself, one law of boolean algebra at a time, before your eyes. The instant a lone ⊤ or ⊥ remains, that side wins. No draws, no luck, no hidden information.
+
+Every deal is solved before it is served, so there are no dead boards — someone can always force a win, and the pie rule makes finding out who into the real game: one player prices the fresh formula and picks a side; the other picks who moves first.
+
+MODES
+• Online duel — challenge a friend or find an opponent through Game Center. Turn-based: play a move, get on with your day, get notified.
+• Duel — pass-and-play on one device, with the pie rule.
+• Adversary — face a perfect solver. Difficulty scales by the formula, never by artificial blunders. Odd rounds you pick the side; even rounds you pick the tempo. First to three.
+• Puzzles — forced wins, exactly like tsumego: "⊤ in 2", unique key move, perfect resistance.
+• Daily gauntlet — five seeded formulas, shareable by code. Same code, same five boards — compare scores.
+
+THE PROOF
+A finished game is literally a proof: replay any round as an equational derivation, each move annotated with the law that fired.
+
+No ads, no tracking, no in-app purchases.

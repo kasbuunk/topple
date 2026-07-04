@@ -1,0 +1,4 @@
+# Fill these in with your Apple Developer account details.
+app_identifier("dev.kasbuunk.topple")
+apple_id("kbuunk@example.com") # your Apple ID
+# team_id("XXXXXXXXXX")        # App Store Connect team

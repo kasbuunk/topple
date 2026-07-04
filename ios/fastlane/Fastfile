@@ -1,0 +1,30 @@
+default_platform(:ios)
+
+platform :ios do
+  desc "Build a signed release IPA (run scripts/build-ios.sh first)"
+  lane :build do
+    build_app(
+      project: "Topple.xcodeproj",
+      scheme: "Topple",
+      export_method: "app-store"
+    )
+  end
+
+  desc "Push a new build to TestFlight"
+  lane :beta do
+    build
+    upload_to_testflight(skip_waiting_for_build_processing: true)
+  end
+
+  desc "Submit to the App Store for review"
+  lane :release do
+    build
+    upload_to_app_store(
+      metadata_path: "fastlane/metadata",
+      precheck_include_in_app_purchases: false,
+      submit_for_review: true,
+      automatic_release: true,
+      force: true
+    )
+  end
+end

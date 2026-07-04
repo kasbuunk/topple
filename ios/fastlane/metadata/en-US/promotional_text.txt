@@ -1,0 +1,1 @@
+Two players adversarially build a valuation. Every move is a choice, every board update is a law, and a finished game is a proof.

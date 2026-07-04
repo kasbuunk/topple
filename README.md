@@ -33,6 +33,10 @@ WIN    The instant a lone ⊤ or ⊥ remains, that side wins. No draws.
 - **Duel** — pass-and-play with the pie rule: one player prices the fresh
   formula and picks a side, the other picks who assigns first. The picker
   role alternates each round.
+- **Online duel** (iOS) — the same pie-rule duel against a friend or a
+  matched opponent, as a Game Center turn-based match. The whole match is a
+  tiny replayable event log: both devices deal the identical formula from a
+  shared seed and exchange only the choices.
 - **Adversary** — versus a *perfect* solver. Difficulty scales by atom count
   and operator mix, never by artificial blunders. Odd rounds you pick the
   side (the dealer guarantees a dominant side exists — find it); even rounds
@@ -104,6 +108,18 @@ The stock panel is mounted upside-down; the binary rotates 180° by default
 (`TOPPLE_ROT=0` to disable). Cross-linking uses the `rust-lld` that ships
 with rustup (see `.cargo/config.toml`) — no external toolchain needed.
 
+### iOS
+
+```sh
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+./scripts/build-ios.sh
+```
+
+The Rust static libraries build from any host; the app itself (`ios/`, a
+Swift shell: touch input, virtual pad, Game Center online duels) needs a
+Mac with Xcode — see [ios/APPSTORE.md](ios/APPSTORE.md) for the full path
+from here to the App Store.
+
 ## Architecture
 
 ```
@@ -117,6 +133,8 @@ crates/
   topple-desktop  winit + softbuffer shim.
   topple-miyoo    /dev/fb0 + evdev shim (static musl).
   topple-web      wasm cdylib with a hand-rolled ABI (+ web/index.html).
+  topple-ios      staticlib with the same style of C ABI (+ ios/, the
+                  Swift shell: touch, virtual pad, Game Center duels).
   topple-shot     headless harness: scripted input → PNG screenshots.
 ```
 

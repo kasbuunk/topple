@@ -4,3 +4,7 @@ web/topple_web.wasm
 
 # GitHub token — never commit
 ghtoken
+ios/Topple.xcodeproj/
+ios/build/
+ios/fastlane/report.xml
+ios/fastlane/README.md

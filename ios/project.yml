@@ -1,0 +1,37 @@
+# XcodeGen manifest — run `xcodegen generate` in ios/ to produce
+# Topple.xcodeproj. Build libtopple_ios.a first: scripts/build-ios.sh.
+name: Topple
+options:
+  bundleIdPrefix: dev.kasbuunk
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: ""           # your Apple Developer team ID
+
+targets:
+  Topple:
+    type: application
+    platform: iOS
+    sources:
+      - path: Topple/Sources
+      - path: Topple/Assets.xcassets
+      - path: Topple/Support/LaunchScreen.storyboard
+      - path: Topple/Support/PrivacyInfo.xcprivacy
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.kasbuunk.topple
+        PRODUCT_NAME: Topple
+        INFOPLIST_FILE: Topple/Support/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Topple/Support/Topple.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Vendor/include/topple.h
+        OTHER_LDFLAGS: "-ltopple_ios"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": "$(SRCROOT)/../target/aarch64-apple-ios/release"
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": "$(SRCROOT)/../target/universal-ios-sim/release"
