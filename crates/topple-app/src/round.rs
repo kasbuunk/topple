@@ -4,7 +4,7 @@
 
 use crate::fb::{Frame, HEIGHT, WIDTH};
 use crate::font::FontEngine;
-use crate::input::Button;
+use crate::input::{Button, TapAction, TapZone};
 use crate::layout::{layout_formula, Layout};
 use crate::theme;
 use topple_core::{
@@ -16,6 +16,8 @@ pub enum PlayerKind {
     /// Human with a pass-and-play label (1 or 2).
     Human(u8),
     Adversary,
+    /// An online opponent: no local input, no AI — moves arrive over the wire.
+    Remote,
 }
 
 impl PlayerKind {
@@ -258,9 +260,32 @@ impl Round {
         self.play_move(Move::new(atom, value), false);
     }
 
+    /// Apply a move that arrived over the wire, with the full cascade
+    /// animation. Ignored unless it is actually the remote side's turn.
+    pub fn apply_remote_move(&mut self, mv: Move) {
+        if self.outcome.is_some() || self.player(self.to_move) != PlayerKind::Remote {
+            return;
+        }
+        self.play_move(mv, false);
+    }
+
+    /// Apply a move instantly, no animation — replaying a stored match.
+    pub fn apply_move_instant(&mut self, mv: Move) {
+        if self.outcome.is_some() {
+            return;
+        }
+        self.play_move(mv, false);
+        self.finish_anim();
+    }
+
+    /// Point the cursor at occurrence `oi` (tap-to-select).
+    pub fn set_cursor(&mut self, oi: usize) {
+        self.cursor = oi;
+    }
+
     // -------------------------------------------------------------- moves --
 
-    fn play_move(&mut self, mv: Move, by_ai: bool) {
+    fn play_move(&mut self, mv: Move, _by_ai: bool) {
         let before = self.board.clone();
         let Ok((after, steps)) = apply_move(&before, mv) else {
             return;
@@ -275,7 +300,11 @@ impl Round {
 
         // Build the animation timeline: assignment flash, then one law at a
         // time, each naming the equation that fired.
-        let who = if by_ai { "Adversary: " } else { "" };
+        let who = match self.player(mover) {
+            PlayerKind::Adversary => "Adversary: ",
+            PlayerKind::Remote => "opponent: ",
+            PlayerKind::Human(_) => "",
+        };
         let mut frames = vec![AnimFrame {
             board: before.clone(),
             highlight: Highlight::AtomAll(mv.atom),
@@ -347,7 +376,7 @@ impl Round {
             }
             return;
         }
-        if self.outcome.is_some() || self.mover_is_human() {
+        if self.outcome.is_some() || self.player(self.to_move) != PlayerKind::Adversary {
             return;
         }
         // Adversary's turn: think for a beat, then play a perfect move.
@@ -367,8 +396,18 @@ impl Round {
 
     // ------------------------------------------------------------- render --
 
-    pub fn render(&mut self, fb: &mut Frame, fonts: &mut FontEngine) {
+    pub fn render(&mut self, fb: &mut Frame, fonts: &mut FontEngine, taps: &mut Vec<TapZone>) {
         fb.clear(theme::BG);
+        // Any tap fast-forwards the cascade or clears the win banner.
+        if self.anim.is_some() || self.outcome.is_some() {
+            taps.push(TapZone {
+                x: 0.0,
+                y: 0.0,
+                w: WIDTH as f32,
+                h: HEIGHT as f32,
+                act: TapAction::Press(vec![Button::A]),
+            });
+        }
 
         // Top bar.
         fb.fill_rect(0, 0, WIDTH as i32, 44, theme::PANEL);
@@ -392,6 +431,7 @@ impl Round {
                 let who = match self.player(self.to_move) {
                     PlayerKind::Human(n) => format!("P{n} · "),
                     PlayerKind::Adversary => "Adversary · ".to_string(),
+                    PlayerKind::Remote => "opponent · ".to_string(),
                 };
                 (
                     format!("{}{} to move", who, self.to_move.glyph()),
@@ -469,6 +509,22 @@ impl Round {
             }
             Highlight::None => {}
         }
+        // Tap any atom to point the cursor at it.
+        if hover.is_some() {
+            for (oi, &gi) in layout.occurrences().iter().enumerate() {
+                let g = &layout.glyphs[gi];
+                let (x, y, w, h) = cell_top(g);
+                // A fat finger needs more than a glyph cell.
+                taps.push(TapZone {
+                    x: x - 8.0,
+                    y: y - 10.0,
+                    w: w + 16.0,
+                    h: h + 20.0,
+                    act: TapAction::Cursor(oi),
+                });
+            }
+        }
+
         // Hovered atom: every occurrence glows together (assignment is
         // global, and the glow is how the board teaches that).
         if let Some(ha) = hover_atom {
@@ -557,6 +613,8 @@ impl Round {
             }
             h.push_str("   A zoom   START menu");
             h
+        } else if self.player(self.to_move) == PlayerKind::Remote {
+            "waiting for the opponent…".to_string()
         } else {
             "the Adversary is reading the board…".to_string()
         };

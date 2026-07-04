@@ -3,13 +3,14 @@
 
 use crate::fb::{Frame, HEIGHT, WIDTH};
 use crate::font::FontEngine;
-use crate::input::{Button, Repeater};
+use crate::input::{menu_taps, Button, Repeater, TapAction, TapZone};
+use crate::online::{Actor, Event, MatchState};
 use crate::round::{PlayerKind, Round, RoundCfg};
 use crate::save::SaveData;
 use crate::theme;
 use topple_core::{
     atom_name, builtin_puzzles, deal, gauntlet, gauntlet_seed, parse_share_code, pretty,
-    share_code, Deal, DealKind, GenParams, Puzzle, Rng, Side, Solver,
+    share_code, Deal, DealKind, GenParams, Move, Puzzle, Rng, Side, Solver,
 };
 
 const RULES_CARD: &[&str] = &[
@@ -41,6 +42,41 @@ const B32: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 enum After {
     Play,
     PickOrder,
+    Title,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TitleItem {
+    Duel,
+    Online,
+    Adversary,
+    Puzzles,
+    Gauntlet,
+    Rules,
+    Strict,
+    Quit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffTarget {
+    Duel,
+    Adversary,
+    Online,
+}
+
+/// What the platform shim should do about an online match right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnlineStatus {
+    /// No online match is active in the app.
+    Inactive,
+    /// Waiting on the local player's input.
+    LocalTurn,
+    /// Waiting on the opponent's move.
+    RemoteTurn,
+    /// Match over: the local player won.
+    WonLocal,
+    /// Match over: the opponent won.
+    WonRemote,
 }
 
 enum Screen {
@@ -52,7 +88,7 @@ enum Screen {
     },
     Difficulty {
         sel: usize,
-        duel: bool,
+        target: DiffTarget,
     },
     PuzzleList {
         sel: usize,
@@ -86,6 +122,11 @@ enum Screen {
         scroll: i32,
     },
     GauntletSummary,
+    /// Online duel: nothing to do but wait for the opponent's choice.
+    OnlineWait {
+        title: String,
+        lines: Vec<String>,
+    },
 }
 
 enum Mode {
@@ -109,6 +150,18 @@ enum Mode {
         results: Vec<bool>,
         deals: Vec<Deal>,
     },
+    Online(OnlineState),
+}
+
+/// A live online duel: the canonical event log plus how much of it the
+/// screens and round already reflect.
+struct OnlineState {
+    st: MatchState,
+    local_p1: bool,
+    /// Events already applied to the current screen/round.
+    applied: usize,
+    /// `encode()` has bytes the platform shim has not shipped yet.
+    dirty: bool,
 }
 
 /// Pie-rule state between the deal and the first assignment.
@@ -134,9 +187,17 @@ pub struct App {
     wants_exit: bool,
     over_timer: u32,
     puzzles: Vec<Puzzle>,
+    /// Platform offers online matches (shows "online duel" on the title).
+    online_available: bool,
+    /// Platform hides "quit" (iOS apps must not exit themselves).
+    can_quit: bool,
+    /// The player asked for an online match at this difficulty.
+    online_request: Option<u8>,
+    /// The player resigned the online match from the pause menu.
+    online_resign: bool,
+    /// Tappable regions, rebuilt on every render.
+    taps: Vec<TapZone>,
 }
-
-const TITLE_ITEMS: usize = 7;
 
 impl App {
     pub fn new(seed: u64, date_iso: &str) -> App {
@@ -154,7 +215,19 @@ impl App {
             wants_exit: false,
             over_timer: 0,
             puzzles: builtin_puzzles(),
+            online_available: false,
+            can_quit: true,
+            online_request: None,
+            online_resign: false,
+            taps: Vec::new(),
         }
+    }
+
+    /// Platform capabilities: whether online duels can be arranged, and
+    /// whether the app may offer to quit (not on iOS).
+    pub fn configure_platform(&mut self, online: bool, can_quit: bool) {
+        self.online_available = online;
+        self.can_quit = can_quit;
     }
 
     pub fn wants_exit(&self) -> bool {
@@ -178,6 +251,7 @@ impl App {
             Screen::RoundOver { .. } => "round-over",
             Screen::Proof { .. } => "proof",
             Screen::GauntletSummary => "gauntlet-summary",
+            Screen::OnlineWait { .. } => "online-wait",
         }
     }
 
@@ -197,6 +271,237 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------- online --
+
+    /// The player asked the platform to arrange an online duel at this
+    /// difficulty. One-shot.
+    pub fn take_online_request(&mut self) -> Option<u8> {
+        self.online_request.take()
+    }
+
+    /// The player resigned the online match from the pause menu. One-shot.
+    pub fn take_online_resign(&mut self) -> bool {
+        std::mem::take(&mut self.online_resign)
+    }
+
+    /// Start a brand-new online match as its creator (P1). The header goes
+    /// straight to the outbox so the opponent's device can deal the same
+    /// formula.
+    pub fn online_create(&mut self, seed: u64, level: u8, local_p1: bool) {
+        self.install_online(MatchState::new(seed, level), local_p1);
+        if let Some(Mode::Online(o)) = &mut self.mode {
+            o.dirty = true;
+        }
+    }
+
+    /// Feed the latest match blob from the wire. Extending the live match
+    /// applies just the new events (animating a fresh remote move); anything
+    /// else rebuilds from scratch. Returns false on a corrupt blob.
+    pub fn online_load(&mut self, data: &[u8], local_p1: bool) -> bool {
+        let Some(st) = MatchState::decode(data) else {
+            return false;
+        };
+        if let Some(Mode::Online(o)) = &mut self.mode {
+            if o.st.seed == st.seed && o.st.level == st.level && o.local_p1 == local_p1 {
+                let ours = o.st.events.len();
+                if st.events.len() >= ours && st.events[..ours] == o.st.events[..] {
+                    o.st = st;
+                    self.online_refresh(true);
+                    return true;
+                }
+                if st.events.len() < ours && o.st.events[..st.events.len()] == st.events[..] {
+                    // A stale echo of data we already have.
+                    return true;
+                }
+            }
+        }
+        self.install_online(st, local_p1);
+        true
+    }
+
+    fn install_online(&mut self, st: MatchState, local_p1: bool) {
+        self.mode = Some(Mode::Online(OnlineState {
+            st,
+            local_p1,
+            applied: 0,
+            dirty: false,
+        }));
+        self.pending = None;
+        self.round = None;
+        self.online_refresh(false);
+    }
+
+    /// Fresh match blob to ship, if any. One-shot.
+    pub fn take_online_outbox(&mut self) -> Option<Vec<u8>> {
+        if let Some(Mode::Online(o)) = &mut self.mode {
+            if o.dirty {
+                o.dirty = false;
+                return Some(o.st.encode());
+            }
+        }
+        None
+    }
+
+    /// Whose input the live online match is waiting on.
+    pub fn online_status(&self) -> OnlineStatus {
+        let Some(Mode::Online(o)) = &self.mode else {
+            return OnlineStatus::Inactive;
+        };
+        match o.st.next_actor() {
+            None => OnlineStatus::Inactive,
+            Some(Actor::P1) if o.local_p1 => OnlineStatus::LocalTurn,
+            Some(Actor::P1) => OnlineStatus::RemoteTurn,
+            Some(Actor::P2) if o.local_p1 => OnlineStatus::RemoteTurn,
+            Some(Actor::P2) => OnlineStatus::LocalTurn,
+            Some(Actor::Over(w)) => {
+                let Some(p1s) = o.st.p1_side() else {
+                    return OnlineStatus::Inactive;
+                };
+                let local = if o.local_p1 { p1s } else { p1s.other() };
+                if w == local {
+                    OnlineStatus::WonLocal
+                } else {
+                    OnlineStatus::WonRemote
+                }
+            }
+        }
+    }
+
+    /// The opponent quit or the platform ended the match: tell the player.
+    pub fn online_opponent_quit(&mut self) {
+        if !matches!(self.mode, Some(Mode::Online(_))) {
+            return;
+        }
+        self.mode = None;
+        self.round = None;
+        self.pending = None;
+        self.screen = Screen::Notice {
+            title: "online duel".into(),
+            lines: vec![
+                "The opponent has left the match.".into(),
+                "The win is yours.".into(),
+            ],
+            next: After::Title,
+        };
+    }
+
+    /// A local pie-rule choice goes on the wire, then the screens catch up.
+    fn online_push(&mut self, e: Event) {
+        if let Some(Mode::Online(o)) = &mut self.mode {
+            o.st.events.push(e);
+            o.dirty = true;
+        }
+        self.online_refresh(false);
+    }
+
+    /// A local assignment just landed in the round's history: log it.
+    fn online_record_local(&mut self, hist_before: usize) {
+        let Some(r) = &self.round else { return };
+        if r.history.len() <= hist_before {
+            return;
+        }
+        let rec = r.history.last().expect("history just grew");
+        if !r.player(rec.mover).is_human() {
+            return;
+        }
+        let mv = rec.mv;
+        if let Some(Mode::Online(o)) = &mut self.mode {
+            o.st.events.push(Event::Assign(mv));
+            o.applied += 1;
+            o.dirty = true;
+        }
+    }
+
+    /// Make the screens and round reflect the event log. `animate` plays the
+    /// newest remote assignment with the full cascade.
+    fn online_refresh(&mut self, animate: bool) {
+        let Some(Mode::Online(o)) = &mut self.mode else {
+            return;
+        };
+        let n = o.st.events.len();
+        // The two pie-rule events carry no round state; mark them applied.
+        o.applied = o.applied.max(n.min(2));
+        let (st, local_p1, applied) = (o.st.clone(), o.local_p1, o.applied);
+        let Some(actor) = st.next_actor() else {
+            self.go_title();
+            return;
+        };
+        if n < 2 {
+            // Pie-rule phase: P1 picks a side, P2 picks the tempo.
+            self.pending = Some(Pending {
+                deal: st.deal_full(),
+                picked_side: st.p1_side(),
+                ai_side: None,
+            });
+            let local_acts = matches!((actor, local_p1), (Actor::P1, true) | (Actor::P2, false));
+            self.screen = if local_acts {
+                if n == 0 {
+                    Screen::PickSide
+                } else {
+                    Screen::PickOrder { sel: 0 }
+                }
+            } else {
+                let lines = if n == 0 {
+                    vec!["The opponent is pricing the formula…".into()]
+                } else {
+                    let yours = st.p1_side().expect("one event means a side was picked");
+                    vec![
+                        format!("You take {}.", yours.glyph()),
+                        "The opponent chooses who assigns first…".into(),
+                    ]
+                };
+                Screen::OnlineWait {
+                    title: "online duel · the pie rule".into(),
+                    lines,
+                }
+            };
+            return;
+        }
+        // Play phase.
+        let p1s = st.p1_side().expect("valid log has a side");
+        let first = st.first().expect("valid log has an order");
+        let local_side = if local_p1 { p1s } else { p1s.other() };
+        if self.round.is_none() {
+            let (top, bot) = if local_side == Side::Top {
+                (PlayerKind::Human(1), PlayerKind::Remote)
+            } else {
+                (PlayerKind::Remote, PlayerKind::Human(1))
+            };
+            self.round = Some(Round::new(
+                st.deal_full().f,
+                first,
+                top,
+                bot,
+                RoundCfg {
+                    allow_preview: !self.strict(),
+                    label: "ONLINE DUEL".into(),
+                    status: format!("you are {}", local_side.glyph()),
+                },
+            ));
+            self.over_timer = 0;
+        }
+        let assigns: Vec<Move> = st.assigns().collect();
+        // Events 0 and 1 are the pie rule, so assign k is event k + 2.
+        if let Some(r) = &mut self.round {
+            for (k, mv) in assigns.iter().enumerate().skip(applied.saturating_sub(2)) {
+                if animate && k + 2 == n && r.player(r.to_move) == PlayerKind::Remote {
+                    r.apply_remote_move(*mv);
+                } else {
+                    r.apply_move_instant(*mv);
+                }
+            }
+        }
+        if let Some(Mode::Online(o)) = &mut self.mode {
+            o.applied = n;
+        }
+        if !matches!(
+            self.screen,
+            Screen::Pause { .. } | Screen::Proof { .. } | Screen::RoundOver { .. }
+        ) {
+            self.screen = Screen::Play;
+        }
+    }
+
     // ------------------------------------------------------------- events --
 
     pub fn on_press(&mut self, b: Button) {
@@ -206,6 +511,41 @@ impl App {
 
     pub fn on_release(&mut self, b: Button) {
         self.repeater.release(b);
+    }
+
+    /// A tap at framebuffer coordinates. Zones come from the latest render,
+    /// so call this only after at least one `render`.
+    pub fn on_tap(&mut self, x: f32, y: f32) {
+        // Later zones sit on top (overlays register after the board).
+        let act = self
+            .taps
+            .iter()
+            .rev()
+            .find(|z| z.hit(x, y))
+            .map(|z| z.act.clone());
+        match act {
+            Some(TapAction::Press(seq)) => {
+                for b in seq {
+                    self.handle(b);
+                }
+            }
+            Some(TapAction::Cursor(oi)) => {
+                if let Some(r) = &mut self.round {
+                    r.set_cursor(oi);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The current tappable regions — for tests and platform shims.
+    pub fn tap_zones(&self) -> &[TapZone] {
+        &self.taps
+    }
+
+    /// The atom under the play cursor — for tests and platform shims.
+    pub fn round_hovered_atom(&self) -> Option<topple_core::Atom> {
+        self.round.as_ref().and_then(|r| r.hovered_atom())
     }
 
     pub fn tick(&mut self, dt_ms: u32) {
@@ -390,6 +730,50 @@ impl App {
         }
     }
 
+    fn title_items(&self) -> Vec<TitleItem> {
+        let mut v = vec![TitleItem::Duel];
+        if self.online_available {
+            v.push(TitleItem::Online);
+        }
+        v.extend([
+            TitleItem::Adversary,
+            TitleItem::Puzzles,
+            TitleItem::Gauntlet,
+            TitleItem::Rules,
+            TitleItem::Strict,
+        ]);
+        if self.can_quit {
+            v.push(TitleItem::Quit);
+        }
+        v
+    }
+
+    fn title_label(&self, it: TitleItem) -> String {
+        match it {
+            TitleItem::Duel => "duel".into(),
+            TitleItem::Online => "online duel".into(),
+            TitleItem::Adversary => "adversary".into(),
+            TitleItem::Puzzles => "puzzles".into(),
+            TitleItem::Gauntlet => "daily gauntlet".into(),
+            TitleItem::Rules => "rules".into(),
+            TitleItem::Strict => {
+                if self.save.strict {
+                    "strict mode · on".into()
+                } else {
+                    "strict mode · off".into()
+                }
+            }
+            TitleItem::Quit => "quit".into(),
+        }
+    }
+
+    fn title_index(&self, it: TitleItem) -> usize {
+        self.title_items()
+            .iter()
+            .position(|&x| x == it)
+            .unwrap_or(0)
+    }
+
     fn vs_ai(&self) -> bool {
         matches!(
             self.mode,
@@ -407,6 +791,7 @@ impl App {
             }
             Some(Mode::Puzzle { index }) => format!("PUZZLE · {}", self.puzzles[*index].title),
             Some(Mode::Gauntlet { idx, .. }) => format!("GAUNTLET · {} OF 5", idx + 1),
+            Some(Mode::Online(_)) => "ONLINE DUEL".to_string(),
             None => String::new(),
         }
     }
@@ -422,6 +807,11 @@ impl App {
             Some(Mode::Gauntlet { results, .. }) => {
                 format!("score {}", results.iter().filter(|&&r| r).count())
             }
+            Some(Mode::Online(o)) => match (o.st.p1_side(), o.local_p1) {
+                (Some(p1s), true) => format!("you are {}", p1s.glyph()),
+                (Some(p1s), false) => format!("you are {}", p1s.other().glyph()),
+                (None, _) => String::new(),
+            },
             None => String::new(),
         }
     }
@@ -534,6 +924,15 @@ impl App {
                 };
                 win_for_menu = human_won;
             }
+            Some(Mode::Online(_)) => {
+                let human_won = round.player(w).is_human();
+                title = if human_won {
+                    format!("{} wins — you", w.glyph())
+                } else {
+                    format!("{} wins — the opponent", w.glyph())
+                };
+                win_for_menu = human_won;
+            }
             None => {}
         }
         self.screen = Screen::RoundOver {
@@ -588,6 +987,9 @@ impl App {
                 };
                 vec![first.into(), "review the proof".into(), "abandon".into()]
             }
+            Some(Mode::Online(_)) => {
+                vec!["main menu".into(), "review the proof".into()]
+            }
             None => vec!["main menu".into()],
         }
     }
@@ -628,6 +1030,7 @@ impl App {
                     self.next_gauntlet_round();
                 }
             }
+            Some(Mode::Online(_)) => self.go_title(),
             None => self.go_title(),
         }
     }
@@ -641,54 +1044,96 @@ impl App {
 
     // ------------------------------------------------------------ handling --
 
-    fn handle(&mut self, b: Button) {
-        match &mut self.screen {
-            Screen::Title { sel } => match b {
-                Button::Up => *sel = (*sel + TITLE_ITEMS - 1) % TITLE_ITEMS,
-                Button::Down => *sel = (*sel + 1) % TITLE_ITEMS,
-                Button::A | Button::Start => match *sel {
-                    0 => self.screen = Screen::Difficulty { sel: 1, duel: true },
-                    1 => {
-                        let lv = self.save.level;
-                        self.screen = Screen::Difficulty {
-                            sel: (lv - 1) as usize,
-                            duel: false,
-                        }
+    fn handle_title(&mut self, b: Button, sel: usize) {
+        let items = self.title_items();
+        let n = items.len();
+        match b {
+            Button::Up => {
+                self.screen = Screen::Title {
+                    sel: (sel + n - 1) % n,
+                }
+            }
+            Button::Down => self.screen = Screen::Title { sel: (sel + 1) % n },
+            Button::A | Button::Start => match items[sel.min(n - 1)] {
+                TitleItem::Duel => {
+                    self.screen = Screen::Difficulty {
+                        sel: 1,
+                        target: DiffTarget::Duel,
                     }
-                    2 => self.screen = Screen::PuzzleList { sel: 0 },
-                    3 => self.screen = Screen::GauntletMenu { sel: 0 },
-                    4 => self.screen = Screen::Rules { from_pause: false },
-                    5 => {
-                        self.save.strict = !self.save.strict;
-                        self.save_dirty = true;
+                }
+                TitleItem::Online => {
+                    self.screen = Screen::Difficulty {
+                        sel: 1,
+                        target: DiffTarget::Online,
                     }
-                    _ => self.wants_exit = true,
-                },
-                _ => {}
+                }
+                TitleItem::Adversary => {
+                    let lv = self.save.level;
+                    self.screen = Screen::Difficulty {
+                        sel: (lv - 1) as usize,
+                        target: DiffTarget::Adversary,
+                    }
+                }
+                TitleItem::Puzzles => self.screen = Screen::PuzzleList { sel: 0 },
+                TitleItem::Gauntlet => self.screen = Screen::GauntletMenu { sel: 0 },
+                TitleItem::Rules => self.screen = Screen::Rules { from_pause: false },
+                TitleItem::Strict => {
+                    self.save.strict = !self.save.strict;
+                    self.save_dirty = true;
+                }
+                TitleItem::Quit => self.wants_exit = true,
             },
+            _ => {}
+        }
+    }
+
+    fn handle(&mut self, b: Button) {
+        if let Screen::Title { sel } = &self.screen {
+            let sel = *sel;
+            self.handle_title(b, sel);
+            return;
+        }
+        // Where "back" lands on the title menu (it shifts with platform items).
+        let t_duel = self.title_index(TitleItem::Duel);
+        let t_online = self.title_index(TitleItem::Online);
+        let t_adv = self.title_index(TitleItem::Adversary);
+        let t_puzzles = self.title_index(TitleItem::Puzzles);
+        let t_gauntlet = self.title_index(TitleItem::Gauntlet);
+        let t_rules = self.title_index(TitleItem::Rules);
+        match &mut self.screen {
+            Screen::Title { .. } => {}
             Screen::Rules { from_pause } => {
                 if matches!(b, Button::A | Button::B | Button::Start) {
                     self.screen = if *from_pause {
                         Screen::Pause { sel: 0 }
                     } else {
-                        Screen::Title { sel: 4 }
+                        Screen::Title { sel: t_rules }
                     };
                 }
             }
-            Screen::Difficulty { sel, duel } => match b {
+            Screen::Difficulty { sel, target } => match b {
                 Button::Up => *sel = (*sel + 4) % 5,
                 Button::Down => *sel = (*sel + 1) % 5,
                 Button::B => {
                     self.screen = Screen::Title {
-                        sel: if *duel { 0 } else { 1 },
+                        sel: match *target {
+                            DiffTarget::Duel => t_duel,
+                            DiffTarget::Online => t_online,
+                            DiffTarget::Adversary => t_adv,
+                        },
                     }
                 }
                 Button::A | Button::Start => {
-                    let (lv, duel) = (*sel as u8 + 1, *duel);
-                    if duel {
-                        self.start_duel(lv);
-                    } else {
-                        self.start_adversary(lv);
+                    let (lv, target) = (*sel as u8 + 1, *target);
+                    match target {
+                        DiffTarget::Duel => self.start_duel(lv),
+                        DiffTarget::Adversary => self.start_adversary(lv),
+                        DiffTarget::Online => {
+                            // The platform shim picks this up and arranges a
+                            // match; the title stays underneath its UI.
+                            self.online_request = Some(lv);
+                            self.screen = Screen::Title { sel: t_online };
+                        }
                     }
                 }
                 _ => {}
@@ -698,7 +1143,7 @@ impl App {
                 match b {
                     Button::Up => *sel = (*sel + n - 1) % n,
                     Button::Down => *sel = (*sel + 1) % n,
-                    Button::B => self.screen = Screen::Title { sel: 2 },
+                    Button::B => self.screen = Screen::Title { sel: t_puzzles },
                     Button::A | Button::Start => {
                         let i = *sel;
                         self.start_puzzle(i);
@@ -708,7 +1153,7 @@ impl App {
             }
             Screen::GauntletMenu { sel } => match b {
                 Button::Up | Button::Down => *sel = 1 - *sel,
-                Button::B => self.screen = Screen::Title { sel: 3 },
+                Button::B => self.screen = Screen::Title { sel: t_gauntlet },
                 Button::A | Button::Start => {
                     if *sel == 0 {
                         let seed = gauntlet_seed(&self.date_iso);
@@ -749,7 +1194,9 @@ impl App {
                     _ => None,
                 };
                 if let Some(s) = side {
-                    if self.vs_ai() {
+                    if matches!(self.mode, Some(Mode::Online(_))) {
+                        self.online_push(Event::PickSide(s));
+                    } else if self.vs_ai() {
                         // The Adversary replies with a perfect tempo pick.
                         let f = self.pending.as_ref().unwrap().deal.f.clone();
                         let first = self.ai_pick_order(&f, s.other());
@@ -781,7 +1228,13 @@ impl App {
                 Button::A | Button::Start | Button::X => {
                     let sel = *sel;
                     let p = self.pending.as_ref().unwrap();
-                    if self.vs_ai() {
+                    if matches!(self.mode, Some(Mode::Online(_))) {
+                        // Online: the order picker is always P2; their side is
+                        // the one P1 did not take.
+                        let local = p.picked_side.expect("P1 picked before P2's turn").other();
+                        let first = if sel == 0 { local } else { local.other() };
+                        self.online_push(Event::PickOrder(first));
+                    } else if self.vs_ai() {
                         // Options: 0 = you first, 1 = Adversary first.
                         let ai = p.ai_side.unwrap();
                         let human = ai.other();
@@ -816,7 +1269,15 @@ impl App {
                             let first = p.ai_side.unwrap();
                             self.build_round(human, first, None);
                         }
+                        After::Title => self.go_title(),
                     }
+                }
+            }
+            Screen::OnlineWait { .. } => {
+                // Leaving is safe: the match lives with the matchmaking
+                // service and reopens on the next turn notification.
+                if matches!(b, Button::B | Button::Start) {
+                    self.go_title();
                 }
             }
             Screen::Play => {
@@ -828,19 +1289,22 @@ impl App {
                         }
                     }
                 }
-                let mut consumed = false;
+                let hist_before = self.round.as_ref().map_or(0, |r| r.history.len());
+                let mut finished = false;
                 if let Some(r) = &mut self.round {
-                    consumed = r.press(b, &mut self.rng, &mut self.fonts);
-                    if r.outcome.is_some() && !r.animating() && !consumed {
-                        // Skip the lingering banner.
-                        self.finish_round();
-                        return;
-                    }
+                    let consumed = r.press(b, &mut self.rng, &mut self.fonts);
+                    // Skip the lingering banner.
+                    finished = r.outcome.is_some() && !r.animating() && !consumed;
                 }
-                let _ = consumed;
+                // Online: a fresh local assignment goes on the wire.
+                self.online_record_local(hist_before);
+                if finished {
+                    self.finish_round();
+                }
             }
             Screen::Pause { sel } => {
                 let items = 4;
+                let online = matches!(self.mode, Some(Mode::Online(_)));
                 match b {
                     Button::Up => *sel = (*sel + items - 1) % items,
                     Button::Down => *sel = (*sel + 1) % items,
@@ -848,6 +1312,14 @@ impl App {
                     Button::A => match *sel {
                         0 => self.screen = Screen::Play,
                         1 => self.screen = Screen::Rules { from_pause: true },
+                        2 if online => {
+                            // Leave: the match keeps waiting with the service.
+                            self.go_title();
+                        }
+                        3 if online => {
+                            self.online_resign = true;
+                            self.go_title();
+                        }
                         2 => {
                             // Restart the round from its opening board.
                             if let Some(r) = &self.round {
@@ -912,10 +1384,12 @@ impl App {
                     if let Some(r) = &self.round {
                         let w = r.outcome;
                         if let Some(w) = w {
+                            let vs_other =
+                                self.vs_ai() || matches!(self.mode, Some(Mode::Online(_)));
                             self.screen = Screen::RoundOver {
                                 sel: 1,
                                 title: format!("{} wins", w.glyph()),
-                                win: r.player(w).is_human() || !self.vs_ai(),
+                                win: r.player(w).is_human() || !vs_other,
                             };
                             return;
                         }
@@ -934,7 +1408,24 @@ impl App {
 
     // ------------------------------------------------------------- render --
 
+    /// Register a tappable rectangle for this frame.
+    fn tap_zone(&mut self, x: f32, y: f32, w: f32, h: f32, act: TapAction) {
+        self.taps.push(TapZone { x, y, w, h, act });
+    }
+
+    /// A whole-screen tap that presses one button (notices, summaries).
+    fn tap_anywhere(&mut self, b: Button) {
+        self.tap_zone(
+            0.0,
+            0.0,
+            WIDTH as f32,
+            HEIGHT as f32,
+            TapAction::Press(vec![b]),
+        );
+    }
+
     pub fn render(&mut self, fb: &mut Frame) {
+        self.taps.clear();
         match &self.screen {
             Screen::Title { .. } => self.render_title(fb),
             Screen::Rules { .. } => self.render_rules(fb),
@@ -947,13 +1438,14 @@ impl App {
             Screen::Notice { .. } => self.render_notice(fb),
             Screen::Play => {
                 if let Some(r) = &mut self.round {
-                    r.render(fb, &mut self.fonts);
+                    r.render(fb, &mut self.fonts, &mut self.taps);
                 }
             }
             Screen::Pause { .. } => self.render_pause(fb),
             Screen::RoundOver { .. } => self.render_round_over(fb),
             Screen::Proof { .. } => self.render_proof(fb),
             Screen::GauntletSummary => self.render_gauntlet_summary(fb),
+            Screen::OnlineWait { .. } => self.render_online_wait(fb),
         }
     }
 
@@ -985,6 +1477,15 @@ impl App {
         let lh = size * 1.7;
         for (i, (item, enabled)) in items.iter().enumerate() {
             let y = y0 + i as f32 * lh;
+            // Tapping a row walks the selection there and confirms.
+            let row_w = (self.fonts.measure(size, item) + 44.0).max(220.0);
+            self.tap_zone(
+                (WIDTH as f32 - row_w) / 2.0,
+                y - size,
+                row_w,
+                lh,
+                TapAction::Press(menu_taps(sel, i)),
+            );
             let color = if i == sel {
                 theme::TEXT
             } else if *enabled {
@@ -1032,21 +1533,18 @@ impl App {
             false,
             "two players adversarially build a valuation",
         );
-        let strict = if self.save.strict {
-            "strict mode · on"
+        let items: Vec<(String, bool)> = self
+            .title_items()
+            .into_iter()
+            .map(|it| (self.title_label(it), true))
+            .collect();
+        // With the online item the list grows to eight rows: tighten up.
+        let (y0, size) = if items.len() >= 8 {
+            (188.0, 20.0)
         } else {
-            "strict mode · off"
+            (200.0, 22.0)
         };
-        let items: Vec<(String, bool)> = vec![
-            ("duel".into(), true),
-            ("adversary".into(), true),
-            ("puzzles".into(), true),
-            ("daily gauntlet".into(), true),
-            ("rules".into(), true),
-            (strict.into(), true),
-            ("quit".into(), true),
-        ];
-        self.draw_menu(fb, &items, sel, 200.0, 22.0);
+        self.draw_menu(fb, &items, sel, y0, size);
         self.fonts.draw_centered(
             fb,
             WIDTH as f32 / 2.0,
@@ -1087,17 +1585,18 @@ impl App {
             false,
             "START to return",
         );
+        self.tap_anywhere(Button::Start);
     }
 
     fn render_difficulty(&mut self, fb: &mut Frame) {
-        let Screen::Difficulty { sel, duel } = self.screen else {
+        let Screen::Difficulty { sel, target } = self.screen else {
             return;
         };
         fb.clear(theme::BG);
-        let title = if duel {
-            "duel — board size"
-        } else {
-            "adversary — board size"
+        let title = match target {
+            DiffTarget::Duel => "duel — board size",
+            DiffTarget::Online => "online duel — board size",
+            DiffTarget::Adversary => "adversary — board size",
         };
         self.fonts
             .draw_centered(fb, WIDTH as f32 / 2.0, 90.0, 26.0, theme::TEXT, true, title);
@@ -1238,6 +1737,15 @@ impl App {
         for i in 0..7 {
             let x = x0 + i as f32 * cell;
             let selected = i == pos;
+            // Tap a cell to select it; tap the selected cell to bump it.
+            let act = if selected {
+                vec![Button::Up]
+            } else if i > pos {
+                vec![Button::Right; i - pos]
+            } else {
+                vec![Button::Left; pos - i]
+            };
+            self.tap_zone(x, 190.0, cell - 8.0, 104.0, TapAction::Press(act));
             fb.fill_rrect(
                 x as i32,
                 210,
@@ -1311,6 +1819,7 @@ impl App {
                     "player 2 — price the formula, pick a side"
                 }
             }
+            Some(Mode::Online(_)) => "online duel — price the formula, pick a side",
             _ => "price the formula, pick a side",
         };
         self.render_formula_panel(fb, picker);
@@ -1324,6 +1833,14 @@ impl App {
         .enumerate()
         {
             let cx = WIDTH as f32 / 2.0 + if i == 0 { -110.0 } else { 110.0 };
+            let side_btn = if i == 0 { Button::X } else { Button::B };
+            self.tap_zone(
+                cx - 62.0,
+                cy - 44.0,
+                124.0,
+                96.0,
+                TapAction::Press(vec![side_btn]),
+            );
             fb.fill_rrect(cx as i32 - 62, cy as i32 - 44, 124, 96, 10, theme::PANEL);
             fb.rect_outline(
                 cx as i32 - 62,
@@ -1360,7 +1877,21 @@ impl App {
         let Screen::PickOrder { sel } = self.screen else {
             return;
         };
-        let (title, labels): (&str, [String; 2]) = if self.vs_ai() {
+        let (title, labels): (&str, [String; 2]) = if matches!(self.mode, Some(Mode::Online(_))) {
+            let p1s = self
+                .pending
+                .as_ref()
+                .and_then(|p| p.picked_side)
+                .unwrap_or(Side::Top);
+            let you = p1s.other();
+            (
+                "choose the tempo — who assigns first?",
+                [
+                    format!("you assign first ({})", you.glyph()),
+                    format!("the opponent assigns first ({})", p1s.glyph()),
+                ],
+            )
+        } else if self.vs_ai() {
             let ai = self
                 .pending
                 .as_ref()
@@ -1431,6 +1962,7 @@ impl App {
             false,
             "A continue",
         );
+        self.tap_anywhere(Button::A);
     }
 
     fn render_pause(&mut self, fb: &mut Frame) {
@@ -1438,8 +1970,10 @@ impl App {
             return;
         };
         if let Some(r) = &mut self.round {
-            r.render(fb, &mut self.fonts);
+            r.render(fb, &mut self.fonts, &mut self.taps);
         }
+        // The overlay owns the screen: drop the board's zones.
+        self.taps.clear();
         fb.fill_rect(0, 0, WIDTH as i32, HEIGHT as i32, theme::BG.with_alpha(200));
         self.fonts.draw_centered(
             fb,
@@ -1450,13 +1984,50 @@ impl App {
             true,
             "paused",
         );
-        let items: Vec<(String, bool)> = vec![
-            ("resume".into(), true),
-            ("rules".into(), true),
-            ("restart round".into(), true),
-            ("quit to menu".into(), true),
-        ];
+        let items: Vec<(String, bool)> = if matches!(self.mode, Some(Mode::Online(_))) {
+            vec![
+                ("resume".into(), true),
+                ("rules".into(), true),
+                ("leave — the match keeps waiting".into(), true),
+                ("resign the match".into(), true),
+            ]
+        } else {
+            vec![
+                ("resume".into(), true),
+                ("rules".into(), true),
+                ("restart round".into(), true),
+                ("quit to menu".into(), true),
+            ]
+        };
         self.draw_menu(fb, &items, sel, 200.0, 21.0);
+    }
+
+    fn render_online_wait(&mut self, fb: &mut Frame) {
+        let (title, lines) = match &self.screen {
+            Screen::OnlineWait { title, lines } => (title.clone(), lines.clone()),
+            _ => return,
+        };
+        self.render_formula_panel(fb, &title);
+        for (i, line) in lines.iter().enumerate() {
+            self.fonts.draw_centered(
+                fb,
+                WIDTH as f32 / 2.0,
+                305.0 + i as f32 * 30.0,
+                20.0,
+                theme::TEXT,
+                false,
+                line,
+            );
+        }
+        self.fonts.draw_centered(
+            fb,
+            WIDTH as f32 / 2.0,
+            HEIGHT as f32 - 16.0,
+            15.0,
+            theme::FAINT,
+            false,
+            "B · back to the menu — the match keeps waiting",
+        );
     }
 
     fn render_round_over(&mut self, fb: &mut Frame) {
@@ -1465,8 +2036,10 @@ impl App {
             _ => return,
         };
         if let Some(r) = &mut self.round {
-            r.render(fb, &mut self.fonts);
+            r.render(fb, &mut self.fonts, &mut self.taps);
         }
+        // The overlay owns the screen: drop the board's zones.
+        self.taps.clear();
         fb.fill_rect(0, 0, WIDTH as i32, HEIGHT as i32, theme::BG.with_alpha(210));
         let color = if title.starts_with('⊤') {
             theme::TOP
@@ -1514,6 +2087,11 @@ impl App {
                 results.iter().filter(|&&r| r).count(),
                 results.len()
             )),
+            Some(Mode::Online(o)) => {
+                let p1s = o.st.p1_side()?;
+                let local = if o.local_p1 { p1s } else { p1s.other() };
+                Some(format!("online duel · you were {}", local.glyph()))
+            }
             None => None,
         }
     }
@@ -1598,6 +2176,22 @@ impl App {
             false,
             "↑↓ scroll · B back",
         );
+        // Tap the top or bottom half to scroll.
+        let half = HEIGHT as f32 / 2.0;
+        self.tap_zone(
+            0.0,
+            0.0,
+            WIDTH as f32,
+            half,
+            TapAction::Press(vec![Button::Up]),
+        );
+        self.tap_zone(
+            0.0,
+            half,
+            WIDTH as f32,
+            half,
+            TapAction::Press(vec![Button::Down]),
+        );
     }
 
     fn render_gauntlet_summary(&mut self, fb: &mut Frame) {
@@ -1668,5 +2262,6 @@ impl App {
             false,
             "A menu",
         );
+        self.tap_anywhere(Button::A);
     }
 }

@@ -32,6 +32,45 @@ pub const ALL_BUTTONS: [Button; 10] = [
     Button::Select,
 ];
 
+/// What tapping a zone does. Menus encode navigation as a button sequence,
+/// so a tap behaves exactly like keys — one input model everywhere.
+#[derive(Clone, Debug)]
+pub enum TapAction {
+    /// Synthesize these presses in order.
+    Press(Vec<Button>),
+    /// Point the play cursor at this atom occurrence.
+    Cursor(usize),
+}
+
+/// A tappable rectangle in framebuffer coordinates, rebuilt every render.
+#[derive(Clone, Debug)]
+pub struct TapZone {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub act: TapAction,
+}
+
+impl TapZone {
+    pub fn hit(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+}
+
+/// The button sequence that walks a menu from `sel` to `target`, then
+/// confirms.
+pub fn menu_taps(sel: usize, target: usize) -> Vec<Button> {
+    let mut seq = Vec::new();
+    if target >= sel {
+        seq.extend(std::iter::repeat_n(Button::Down, target - sel));
+    } else {
+        seq.extend(std::iter::repeat_n(Button::Up, sel - target));
+    }
+    seq.push(Button::A);
+    seq
+}
+
 /// Auto-repeat for held d-pad directions, synthesized app-side so every
 /// frontend behaves identically.
 pub struct Repeater {
