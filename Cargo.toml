@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/topple-core",
+    "crates/topple-app",
+    "crates/topple-desktop",
+    "crates/topple-miyoo",
+    "crates/topple-web",
+    "crates/topple-shot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+panic = "abort"
+
+[profile.release.package.topple-web]
+opt-level = "s"

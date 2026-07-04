@@ -1,0 +1,13 @@
+[package]
+name = "topple-miyoo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "topple-miyoo"
+path = "src/main.rs"
+
+[dependencies]
+topple-app = { path = "../topple-app" }
+libc = "0.2"

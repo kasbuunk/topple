@@ -1,0 +1,13 @@
+[package]
+name = "topple-shot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "topple-shot"
+path = "src/main.rs"
+
+[dependencies]
+topple-app = { path = "../topple-app" }
+png = "0.17"

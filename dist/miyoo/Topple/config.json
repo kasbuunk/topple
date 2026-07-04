@@ -1,0 +1,6 @@
+{
+    "label": "TOPPLE",
+    "icon": "icon.png",
+    "launch": "launch.sh",
+    "description": "Two players adversarially build a valuation"
+}

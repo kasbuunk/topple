@@ -1,0 +1,5 @@
+# Cross-compiling for the Miyoo Mini Plus (ARMv7, static musl) uses the
+# lld that ships with rustup — no external toolchain needed.
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]

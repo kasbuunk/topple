@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>⊤OPP⊥E</title>
+<style>
+  html, body {
+    margin: 0; height: 100%;
+    background: #0a0d11; color: #8b949e;
+    font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px;
+  }
+  canvas {
+    image-rendering: pixelated;
+    width: min(96vw, calc(92vh * 4 / 3));
+    aspect-ratio: 4 / 3;
+    border: 1px solid #2a3340;
+    outline: none;
+  }
+  .keys { text-align: center; opacity: .8; }
+  .keys b { color: #e6edf3; font-weight: 600; }
+  .top { color: #ffc53d; } .bot { color: #4dc4ff; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="640" height="480" tabindex="0"></canvas>
+<div class="keys">
+  arrows move · <b>X</b>/<b>T</b> set <b class="top">⊤</b> · <b>B</b>/<b>F</b> set <b class="bot">⊥</b> ·
+  <b>A</b>/<b>Z</b> zoom · <b>Y</b>/<b>P</b> peek · <b>Enter</b> menu
+</div>
+<script type="module">
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+
+const { instance } = await WebAssembly.instantiateStreaming(
+  fetch("topple_web.wasm"), {}
+);
+const wasm = instance.exports;
+
+// Boot with a random seed and the local date (the daily gauntlet is *your* day).
+const now = new Date();
+const seed = crypto.getRandomValues(new Uint32Array(2));
+wasm.boot(seed[0], seed[1], now.getFullYear(), now.getMonth() + 1, now.getDate());
+
+// Restore the save from localStorage.
+const saved = localStorage.getItem("topple-save");
+if (saved) {
+  try {
+    const bytes = Uint8Array.from(atob(saved), c => c.charCodeAt(0));
+    const ptr = wasm.inbox_alloc(bytes.length);
+    new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+    wasm.inbox_load_save();
+  } catch (e) { /* stale save, ignore */ }
+}
+
+// Keyboard → abstract pad. Indexes match the wasm ABI.
+const KEYMAP = {
+  ArrowUp: 0, KeyW: 0, ArrowDown: 1, KeyS: 1, ArrowLeft: 2, ArrowRight: 3,
+  KeyA: 4, KeyZ: 4, KeyB: 5, KeyF: 5, KeyX: 6, KeyT: 6, KeyY: 7, KeyP: 7,
+  Enter: 8, Escape: 8, Tab: 9, Backspace: 9,
+};
+addEventListener("keydown", e => {
+  const b = KEYMAP[e.code];
+  if (b === undefined || e.repeat) return;
+  e.preventDefault();
+  wasm.key(b, 1);
+});
+addEventListener("keyup", e => {
+  const b = KEYMAP[e.code];
+  if (b === undefined) return;
+  e.preventDefault();
+  wasm.key(b, 0);
+});
+canvas.focus();
+
+const W = wasm.fb_width(), H = wasm.fb_height();
+let last = performance.now();
+function loop(t) {
+  const dt = Math.min(100, Math.max(0, Math.round(t - last)));
+  last = t;
+  wasm.frame(dt);
+  // The wasm memory can grow; re-view every frame.
+  const px = new Uint8ClampedArray(wasm.memory.buffer, wasm.fb_ptr(), W * H * 4);
+  ctx.putImageData(new ImageData(px, W, H), 0, 0);
+  const n = wasm.save_poll();
+  if (n > 0) {
+    const blob = new Uint8Array(wasm.memory.buffer, wasm.save_ptr(), n);
+    localStorage.setItem("topple-save", btoa(String.fromCharCode(...blob)));
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
