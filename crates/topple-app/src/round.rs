@@ -39,6 +39,8 @@ enum Highlight {
     None,
     AtomAll(Atom),
     Redex(Path),
+    /// Freshly rewritten spots — what the last change left behind.
+    Rewritten(Vec<Path>),
 }
 
 struct AnimFrame {
@@ -54,9 +56,17 @@ struct Anim {
     t: u32,
 }
 
-const SUBST_MS: u32 = 700;
-const LAW_MS: u32 = 850;
-const FINAL_MS: u32 = 300;
+/// The last move being re-read: the same frames as the cascade animation,
+/// stepped by hand instead of a clock.
+struct Review {
+    frames: Vec<AnimFrame>,
+    idx: usize,
+}
+
+const SUBST_MS: u32 = 900;
+const LAW_MS: u32 = 900;
+const REWRITE_MS: u32 = 700;
+const FINAL_MS: u32 = 600;
 const AI_DELAY_MS: u32 = 700;
 
 pub struct RoundCfg {
@@ -80,6 +90,7 @@ pub struct Round {
     zoom: Option<Path>,
     preview: bool,
     anim: Option<Anim>,
+    review: Option<Review>,
     ai_timer: u32,
     solver: Solver,
     last_layout: Option<Layout>,
@@ -105,6 +116,7 @@ impl Round {
             zoom: None,
             preview: false,
             anim: None,
+            review: None,
             ai_timer: 0,
             solver: Solver::new(),
             last_layout: None,
@@ -154,13 +166,21 @@ impl Round {
     /// Handle a button during play. Returns true if the button was consumed.
     pub fn press(&mut self, b: Button, rng: &mut Rng, fonts: &mut FontEngine) -> bool {
         self.ensure_layout(fonts);
+        if self.review.is_some() {
+            return self.press_review(b);
+        }
         if self.anim.is_some() {
-            // Any face button fast-forwards the cascade.
-            if matches!(b, Button::A | Button::B | Button::X | Button::Y) {
-                self.finish_anim();
-                return true;
+            match b {
+                // Step the cascade at reading pace…
+                Button::A | Button::X | Button::Y => self.step_anim(),
+                // …or skip straight to the settled board.
+                Button::B => self.finish_anim(),
+                _ => return false,
             }
-            return false;
+            return true;
+        }
+        if b == Button::Select {
+            return self.open_review();
         }
         if self.outcome.is_some() || !self.mover_is_human() {
             return false;
@@ -180,6 +200,46 @@ impl Round {
             Button::A => self.toggle_zoom(),
             _ => return false,
         }
+        true
+    }
+
+    /// Buttons while re-reading the last move. Consumes everything but Start
+    /// (the pause menu) so a stray press cannot fall through to the round.
+    fn press_review(&mut self, b: Button) -> bool {
+        let Some(rv) = &mut self.review else {
+            return false;
+        };
+        match b {
+            Button::Right | Button::A | Button::X | Button::Y => {
+                rv.idx += 1;
+                if rv.idx >= rv.frames.len() {
+                    self.review = None;
+                }
+            }
+            Button::Left => rv.idx = rv.idx.saturating_sub(1),
+            Button::B | Button::Select => self.review = None,
+            Button::Start => return false,
+            _ => {}
+        }
+        true
+    }
+
+    /// Reopen the last move as a hand-stepped replay.
+    fn open_review(&mut self) -> bool {
+        if self.outcome.is_some() {
+            // Once the round is over, the proof screen has the whole story.
+            return false;
+        }
+        let Some(rec) = self.history.last().cloned() else {
+            return false;
+        };
+        let after = rec
+            .steps
+            .last()
+            .map(|s| s.after.clone())
+            .unwrap_or_else(|| rec.before.substitute(rec.mv.atom, rec.mv.value));
+        let frames = self.move_frames(rec.mover, rec.mv, &rec.before, &rec.steps, &after);
+        self.review = Some(Review { frames, idx: 0 });
         true
     }
 
@@ -298,34 +358,68 @@ impl Round {
             steps: steps.clone(),
         });
 
-        // Build the animation timeline: assignment flash, then one law at a
-        // time, each naming the equation that fired.
+        let frames = self.move_frames(mover, mv, &before, &steps, &after);
+        self.board = after;
+        self.anim = Some(Anim {
+            frames,
+            idx: 0,
+            t: 0,
+        });
+        self.review = None;
+        self.zoom = None;
+        self.preview = false;
+        self.cursor = 0;
+        self.ai_timer = 0;
+        self.last_layout = None;
+    }
+
+    /// The frame timeline of one move: the assignment flash, the constants it
+    /// filled in, then each law twice — the redex it saw, the result it left.
+    fn move_frames(
+        &self,
+        mover: Side,
+        mv: Move,
+        before: &F,
+        steps: &[Step],
+        after: &F,
+    ) -> Vec<AnimFrame> {
         let who = match self.player(mover) {
             PlayerKind::Adversary => "Adversary: ",
             PlayerKind::Remote => "opponent: ",
             PlayerKind::Human(_) => "",
         };
+        let assign = format!(
+            "{}{} ≔ {}",
+            who,
+            atom_name(mv.atom),
+            if mv.value { '⊤' } else { '⊥' }
+        );
         let mut frames = vec![AnimFrame {
             board: before.clone(),
             highlight: Highlight::AtomAll(mv.atom),
-            toast: Some((
-                format!(
-                    "{}{} ≔ {}",
-                    who,
-                    atom_name(mv.atom),
-                    if mv.value { '⊤' } else { '⊥' }
-                ),
-                false,
-            )),
+            toast: Some((assign.clone(), false)),
             dur: SUBST_MS,
         }];
         let mut cur = before.substitute(mv.atom, mv.value);
-        for s in &steps {
+        frames.push(AnimFrame {
+            board: cur.clone(),
+            highlight: Highlight::Rewritten(atom_paths(before, mv.atom)),
+            toast: Some((assign, false)),
+            dur: REWRITE_MS,
+        });
+        for s in steps {
+            let eq = s.law.equation().to_string();
             frames.push(AnimFrame {
                 board: cur.clone(),
                 highlight: Highlight::Redex(s.path.clone()),
-                toast: Some((s.law.equation().to_string(), true)),
+                toast: Some((eq.clone(), true)),
                 dur: LAW_MS,
+            });
+            frames.push(AnimFrame {
+                board: s.after.clone(),
+                highlight: Highlight::Rewritten(vec![s.path.clone()]),
+                toast: Some((eq, true)),
+                dur: REWRITE_MS,
             });
             cur = s.after.clone();
         }
@@ -335,18 +429,19 @@ impl Round {
             toast: None,
             dur: FINAL_MS,
         });
+        frames
+    }
 
-        self.board = after;
-        self.anim = Some(Anim {
-            frames,
-            idx: 0,
-            t: 0,
-        });
-        self.zoom = None;
-        self.preview = false;
-        self.cursor = 0;
-        self.ai_timer = 0;
-        self.last_layout = None;
+    /// One frame forward, its clock restarted — impatient taps still leave
+    /// each law readable.
+    fn step_anim(&mut self) {
+        if let Some(anim) = &mut self.anim {
+            anim.t = 0;
+            anim.idx += 1;
+            if anim.idx >= anim.frames.len() {
+                self.finish_anim();
+            }
+        }
     }
 
     fn finish_anim(&mut self) {
@@ -376,6 +471,10 @@ impl Round {
             }
             return;
         }
+        if self.review.is_some() {
+            // The Adversary waits while you re-read the last move.
+            return;
+        }
         if self.outcome.is_some() || self.player(self.to_move) != PlayerKind::Adversary {
             return;
         }
@@ -398,8 +497,9 @@ impl Round {
 
     pub fn render(&mut self, fb: &mut Frame, fonts: &mut FontEngine, taps: &mut Vec<TapZone>) {
         fb.clear(theme::BG);
-        // Any tap fast-forwards the cascade or clears the win banner.
-        if self.anim.is_some() || self.outcome.is_some() {
+        // During a cascade or replay a tap steps forward; on the win banner
+        // it clears.
+        if self.anim.is_some() || self.review.is_some() || self.outcome.is_some() {
             taps.push(TapZone {
                 x: 0.0,
                 y: 0.0,
@@ -424,33 +524,43 @@ impl Round {
             &self.cfg.status,
         );
 
-        // Turn / outcome banner.
-        let (banner, color) = match self.outcome {
-            Some(w) => (format!("{} wins", w.glyph()), theme::side_color(w)),
-            None => {
-                let who = match self.player(self.to_move) {
-                    PlayerKind::Human(n) => format!("P{n} · "),
-                    PlayerKind::Adversary => "Adversary · ".to_string(),
-                    PlayerKind::Remote => "opponent · ".to_string(),
-                };
-                (
-                    format!("{}{} to move", who, self.to_move.glyph()),
-                    theme::side_color(self.to_move),
-                )
+        // Turn / outcome / replay banner.
+        let (banner, color) = if let Some(rv) = &self.review {
+            (
+                format!("last move · {}/{}", rv.idx + 1, rv.frames.len()),
+                theme::DIM,
+            )
+        } else {
+            match self.outcome {
+                Some(w) => (format!("{} wins", w.glyph()), theme::side_color(w)),
+                None => {
+                    let who = match self.player(self.to_move) {
+                        PlayerKind::Human(n) => format!("P{n} · "),
+                        PlayerKind::Adversary => "Adversary · ".to_string(),
+                        PlayerKind::Remote => "opponent · ".to_string(),
+                    };
+                    (
+                        format!("{}{} to move", who, self.to_move.glyph()),
+                        theme::side_color(self.to_move),
+                    )
+                }
             }
         };
         fonts.draw_centered(fb, WIDTH as f32 / 2.0, 78.0, 22.0, color, true, &banner);
 
-        // The board (during animation, the anim frame's board).
-        let (board, highlight, toast) = match &self.anim {
-            Some(a) if a.idx < a.frames.len() => {
-                let fr = &a.frames[a.idx];
-                (fr.board.clone(), fr.highlight.clone(), fr.toast.clone())
-            }
-            _ => (self.board.clone(), Highlight::None, None),
+        // The board (during a cascade or replay, that frame's board).
+        let frame = match &self.anim {
+            Some(a) if a.idx < a.frames.len() => Some(&a.frames[a.idx]),
+            _ => self.review.as_ref().and_then(|rv| rv.frames.get(rv.idx)),
+        };
+        let (board, highlight, toast) = match frame {
+            Some(fr) => (fr.board.clone(), fr.highlight.clone(), fr.toast.clone()),
+            None => (self.board.clone(), Highlight::None, None),
         };
 
-        let zoomed = self.anim.is_none().then_some(self.zoom.as_ref()).flatten();
+        let zoomed = (self.anim.is_none() && self.review.is_none())
+            .then_some(self.zoom.as_ref())
+            .flatten();
         if zoomed.is_some() {
             fonts.draw_centered(
                 fb,
@@ -473,7 +583,11 @@ impl Round {
         );
 
         // Highlights under the glyphs.
-        let hover = if self.anim.is_none() && self.outcome.is_none() && self.mover_is_human() {
+        let hover = if self.anim.is_none()
+            && self.review.is_none()
+            && self.outcome.is_none()
+            && self.mover_is_human()
+        {
             let occs = layout.occurrences();
             occs.get(self.cursor.min(occs.len().saturating_sub(1)))
                 .copied()
@@ -505,6 +619,15 @@ impl Round {
                     let g = &layout.glyphs[gi];
                     let (x, y, w, h) = cell_top(g);
                     fb.fill_rect(x as i32, y as i32, w as i32, h as i32, theme::REDEX_BG);
+                }
+            }
+            Highlight::Rewritten(paths) => {
+                for p in paths {
+                    for gi in layout.glyph_span_of_path(p) {
+                        let g = &layout.glyphs[gi];
+                        let (x, y, w, h) = cell_top(g);
+                        fb.fill_rect(x as i32, y as i32, w as i32, h as i32, theme::REWRITE_BG);
+                    }
                 }
             }
             Highlight::None => {}
@@ -595,15 +718,38 @@ impl Round {
         }
 
         // Ghost preview: where each assignment of the hovered atom lands.
-        if self.preview && self.anim.is_none() {
+        if self.preview && self.anim.is_none() && self.review.is_none() {
             if let Some(a) = hover_atom {
                 self.render_preview(fb, fonts, a);
             }
         }
 
+        // A tappable "replay the last move" chip whenever the board is calm.
+        if self.anim.is_none()
+            && self.review.is_none()
+            && self.outcome.is_none()
+            && !self.history.is_empty()
+        {
+            let text = "↺ last move";
+            let w = fonts.measure(15.0, text) + 20.0;
+            let (x, y, h) = (16.0, 54.0, 26.0);
+            fb.fill_rrect(x as i32, y as i32, w as i32, h as i32, 6, theme::PANEL);
+            fb.rect_outline(x as i32, y as i32, w as i32, h as i32, 1, theme::PANEL_EDGE);
+            fonts.draw(fb, x + 10.0, y + 18.0, 15.0, theme::DIM, false, text);
+            taps.push(TapZone {
+                x: x - 6.0,
+                y: y - 8.0,
+                w: w + 12.0,
+                h: h + 16.0,
+                act: TapAction::Press(vec![Button::Select]),
+            });
+        }
+
         // Help bar.
-        let help = if self.anim.is_some() {
-            "any button: fast-forward".to_string()
+        let help = if self.review.is_some() {
+            "◂ ▸ step   B done".to_string()
+        } else if self.anim.is_some() {
+            "A next   B skip".to_string()
         } else if self.outcome.is_some() {
             String::new()
         } else if self.mover_is_human() {
@@ -665,4 +811,30 @@ impl Round {
             );
         }
     }
+}
+
+/// Paths of every occurrence of `atom` — the spots a substitution fills.
+fn atom_paths(f: &F, atom: Atom) -> Vec<Path> {
+    fn go(f: &F, atom: Atom, path: &mut Path, out: &mut Vec<Path>) {
+        match f {
+            F::Atom(a) if *a == atom => out.push(path.clone()),
+            F::Not(x) => {
+                path.push(0);
+                go(x, atom, path, out);
+                path.pop();
+            }
+            F::Bin(_, l, r) => {
+                path.push(0);
+                go(l, atom, path, out);
+                path.pop();
+                path.push(1);
+                go(r, atom, path, out);
+                path.pop();
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(f, atom, &mut Vec::new(), &mut out);
+    out
 }

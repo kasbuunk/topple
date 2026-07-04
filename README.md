@@ -63,9 +63,13 @@ fired, verbatim an equational derivation.
 | zoom into a subformula | **A** | **A** or **Z** |
 | ghost-preview both assignments | **Y** | **Y** or **P** |
 | rules card / pause | **START** | **Enter** or **Esc** |
+| replay the last move | **SELECT** | **Tab** or **Backspace** |
 
 All occurrences of the hovered atom glow together — assignment is global.
-During a cascade, any face button fast-forwards.
+The cascade shows each law twice — the redex it matched (amber), then what
+it left behind (green). **A** steps it at your own pace, **B** skips to the
+settled board, and the **↺ last move** chip (or SELECT) replays the whole
+move afterwards, one step at a time with ◂ ▸.
 
 ## Building
 

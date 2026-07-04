@@ -18,6 +18,7 @@ pub const GLOW_BG: Color = Color::rgba(0x3A, 0x46, 0x63, 0xB4);
 pub const CURSOR: Color = Color::rgb(0xF0, 0xF6, 0xFC);
 pub const REDEX_BG: Color = Color::rgba(0x5A, 0x46, 0x14, 0xC8);
 pub const REDEX_EDGE: Color = Color::rgb(0xC8, 0x9B, 0x2D);
+pub const REWRITE_BG: Color = Color::rgba(0x17, 0x46, 0x26, 0xC8); // green — what a rewrite left behind
 
 pub const GOOD: Color = Color::rgb(0x3F, 0xB9, 0x50);
 pub const BAD: Color = Color::rgb(0xF8, 0x51, 0x49);
