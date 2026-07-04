@@ -1542,6 +1542,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "topple-ios"
+version = "0.1.0"
+dependencies = [
+ "topple-app",
+]
+
+[[package]]
 name = "topple-miyoo"
 version = "0.1.0"
 dependencies = [
@@ -1553,6 +1560,7 @@ dependencies = [
 name = "topple-shot"
 version = "0.1.0"
 dependencies = [
+ "fontdue",
  "png",
  "topple-app",
 ]
